@@ -1,10 +1,5 @@
 """
-محرك التشفير المتقدم - يدعم:
-- AES-GCM, ChaCha20-Poly1305
-- RSA (مفتاح عام/خاص)
-- XChaCha20
-- Argon2 (لتوليد المفاتيح)
-- تشفير الملفات الكبيرة
+محرك التشفير المتقدم - دعم التوقيع (Ed25519, RSA-PSS)، وتشفير المفتاح الخاص
 """
 
 import hashlib
@@ -15,165 +10,209 @@ from typing import Tuple, Optional, Union
 from pathlib import Path
 
 try:
-    from Cryptodome.Cipher import AES, ChaCha20, PKCS1_OAEP
+    from Cryptodome.Cipher import AES, ChaCha20_Poly1305
     from Cryptodome.PublicKey import RSA
+    try:
+        from Cryptodome.PublicKey import Ed25519
+        HAS_ED25519 = True
+    except Exception:
+        HAS_ED25519 = False
     from Cryptodome.Random import get_random_bytes
     from Cryptodome.Protocol.KDF import scrypt, PBKDF2
     from Cryptodome.Util.Padding import pad, unpad
+    from Cryptodome.Signature import pss
+    from Cryptodome.Hash import SHA512
+    from Cryptodome.Signature import eddsa
     HAS_CRYPTODOME = True
 except ImportError:
     HAS_CRYPTODOME = False
+    HAS_ED25519 = False
 
 from infrastructure.logger import app_logger
 
 
 class CryptoEngine:
     """
-    محرك التشفير المتقدم
+    محرك التشفير المتقدم مع دعم لتوليد المفاتيح والتوقيع.
     """
 
     @staticmethod
-    def derive_key_argon2(password: str, salt: bytes, key_length: int = 32) -> bytes:
-        """توليد مفتاح باستخدام Argon2 (محاكاة باستخدام scrypt)"""
+    def derive_key_scrypt(password: str, salt: bytes, key_length: int = 32) -> bytes:
         try:
-            return scrypt(password.encode(), salt, key_length, N=2**14, r=8, p=1)
+            return scrypt(password.encode(), salt, key_length, N=2 ** 14, r=8, p=1)
         except Exception as e:
             app_logger.error(f"Key derivation failed: {e}")
             raise
 
     @staticmethod
     def derive_key_pbkdf2(password: str, salt: bytes, key_length: int = 32) -> bytes:
-        """توليد مفتاح باستخدام PBKDF2"""
         return PBKDF2(password.encode(), salt, dkLen=key_length, count=100000)
 
+    # ===== AES-GCM helpers for encrypting private keys =====
     @staticmethod
-    def aes_encrypt(data: bytes, key: bytes) -> bytes:
-        """تشفير AES-GCM"""
+    def encrypt_private_key(private_pem: bytes, sym_key: bytes) -> bytes:
+        """Encrypt private PEM bytes using AES-GCM with a derived 32-byte key.
+        Format: nonce(12) + tag(16) + ciphertext
+        """
         if not HAS_CRYPTODOME:
             raise ImportError("pycryptodome not installed")
         try:
-            cipher = AES.new(key, AES.MODE_GCM)
+            key = hashlib.sha256(sym_key).digest()
+            nonce = get_random_bytes(12)
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+            ct, tag = cipher.encrypt_and_digest(private_pem)
+            return nonce + tag + ct
+        except Exception as e:
+            app_logger.error(f"encrypt_private_key failed: {e}")
+            raise
+
+    @staticmethod
+    def decrypt_private_key(enc_blob: bytes, sym_key: bytes) -> bytes:
+        """Decrypt private key produced by encrypt_private_key
+        Expects: nonce(12) + tag(16) + ciphertext
+        Returns private_pem bytes
+        """
+        if not HAS_CRYPTODOME:
+            raise ImportError("pycryptodome not installed")
+        try:
+            if len(enc_blob) < 28:
+                raise ValueError("Invalid encrypted blob")
+            key = hashlib.sha256(sym_key).digest()
+            nonce = enc_blob[:12]
+            tag = enc_blob[12:28]
+            ct = enc_blob[28:]
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+            return cipher.decrypt_and_verify(ct, tag)
+        except Exception as e:
+            app_logger.error(f"decrypt_private_key failed: {e}")
+            raise
+
+    # ===== Ed25519 =====
+    @staticmethod
+    def generate_ed25519_keypair() -> Tuple[bytes, bytes]:
+        if not HAS_CRYPTODOME or not HAS_ED25519:
+            raise ImportError("Ed25519 not available in pycryptodome")
+        try:
+            key = Ed25519.generate()
+            private_pem = key.export_key(format='PEM')
+            public_pem = key.public_key().export_key(format='PEM')
+            return public_pem, private_pem
+        except Exception as e:
+            app_logger.error(f"generate_ed25519_keypair failed: {e}")
+            raise
+
+    @staticmethod
+    def sign_with_ed25519(data: bytes, private_pem: bytes) -> bytes:
+        if not HAS_CRYPTODOME or not HAS_ED25519:
+            raise ImportError("Ed25519 not available in pycryptodome")
+        try:
+            key = Ed25519.import_key(private_pem)
+            signer = eddsa.new(key=key, mode='rfc8032')
+            sig = signer.sign(data)
+            return sig
+        except Exception as e:
+            app_logger.error(f"sign_with_ed25519 failed: {e}")
+            raise
+
+    @staticmethod
+    def verify_ed25519(data: bytes, signature: bytes, public_pem: bytes) -> bool:
+        if not HAS_CRYPTODOME or not HAS_ED25519:
+            raise ImportError("Ed25519 not available in pycryptodome")
+        try:
+            key = Ed25519.import_key(public_pem)
+            verifier = eddsa.new(key=key, mode='rfc8032')
+            verifier.verify(data, signature)
+            return True
+        except Exception as e:
+            app_logger.error(f"verify_ed25519 failed: {e}")
+            return False
+
+    # ===== RSA-PSS =====
+    @staticmethod
+    def generate_rsa_keypair(key_size: int = 4096) -> Tuple[bytes, bytes]:
+        if not HAS_CRYPTODOME:
+            raise ImportError("pycryptodome not installed")
+        try:
+            key = RSA.generate(key_size)
+            private_pem = key.export_key(format='PEM')
+            public_pem = key.publickey().export_key(format='PEM')
+            return public_pem, private_pem
+        except Exception as e:
+            app_logger.error(f"generate_rsa_keypair failed: {e}")
+            raise
+
+    @staticmethod
+    def sign_with_rsa_pss(data: bytes, private_pem: bytes) -> bytes:
+        if not HAS_CRYPTODOME:
+            raise ImportError("pycryptodome not installed")
+        try:
+            key = RSA.import_key(private_pem)
+            h = SHA512.new(data)
+            signature = pss.new(key).sign(h)
+            return signature
+        except Exception as e:
+            app_logger.error(f"sign_with_rsa_pss failed: {e}")
+            raise
+
+    @staticmethod
+    def verify_rsa_pss(data: bytes, signature: bytes, public_pem: bytes) -> bool:
+        if not HAS_CRYPTODOME:
+            raise ImportError("pycryptodome not installed")
+        try:
+            key = RSA.import_key(public_pem)
+            h = SHA512.new(data)
+            pss.new(key).verify(h, signature)
+            return True
+        except Exception as e:
+            app_logger.error(f"verify_rsa_pss failed: {e}")
+            return False
+
+    # ===== Generic helpers =====
+    @staticmethod
+    def sha256(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def base64_encode(data: bytes) -> str:
+        return base64.b64encode(data).decode('utf-8')
+
+    @staticmethod
+    def base64_decode(data: str) -> bytes:
+        return base64.b64decode(data)
+
+    # legacy simple AES helpers (kept for backward compatibility)
+    @staticmethod
+    def aes_encrypt(data: bytes, key: bytes) -> bytes:
+        if not HAS_CRYPTODOME:
+            raise ImportError("pycryptodome not installed")
+        try:
+            nonce = get_random_bytes(12)
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
             ciphertext, tag = cipher.encrypt_and_digest(data)
-            return cipher.nonce + tag + ciphertext
+            return nonce + tag + ciphertext
         except Exception as e:
             app_logger.error(f"AES encryption failed: {e}")
             raise
 
     @staticmethod
     def aes_decrypt(encrypted: bytes, key: bytes) -> bytes:
-        """فك تشفير AES-GCM"""
         if not HAS_CRYPTODOME:
             raise ImportError("pycryptodome not installed")
         try:
-            nonce = encrypted[:16]
-            tag = encrypted[16:32]
-            ciphertext = encrypted[32:]
+            if len(encrypted) < 28:
+                raise ValueError("Invalid encrypted data")
+            nonce = encrypted[:12]
+            tag = encrypted[12:28]
+            ciphertext = encrypted[28:]
             cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
             return cipher.decrypt_and_verify(ciphertext, tag)
         except Exception as e:
             app_logger.error(f"AES decryption failed: {e}")
             raise
 
-    @staticmethod
-    def aes_cbc_encrypt(data: bytes, key: bytes) -> bytes:
-        """تشفير AES-CBC"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            cipher = AES.new(key, AES.MODE_CBC)
-            ct_bytes = cipher.encrypt(pad(data, AES.block_size))
-            return cipher.iv + ct_bytes
-        except Exception as e:
-            app_logger.error(f"AES-CBC encryption failed: {e}")
-            raise
-
-    @staticmethod
-    def aes_cbc_decrypt(encrypted: bytes, key: bytes) -> bytes:
-        """فك تشفير AES-CBC"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            iv = encrypted[:AES.block_size]
-            ct = encrypted[AES.block_size:]
-            cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-            pt = unpad(cipher.decrypt(ct), AES.block_size)
-            return pt
-        except Exception as e:
-            app_logger.error(f"AES-CBC decryption failed: {e}")
-            raise
-
-    @staticmethod
-    def chacha20_encrypt(data: bytes, key: bytes) -> bytes:
-        """تشفير ChaCha20-Poly1305"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            nonce = get_random_bytes(12)
-            cipher = ChaCha20.new(key=key, nonce=nonce)
-            ciphertext, tag = cipher.encrypt_and_digest(data)
-            return nonce + tag + ciphertext
-        except Exception as e:
-            app_logger.error(f"ChaCha20 encryption failed: {e}")
-            raise
-
-    @staticmethod
-    def chacha20_decrypt(encrypted: bytes, key: bytes) -> bytes:
-        """فك تشفير ChaCha20-Poly1305"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            nonce = encrypted[:12]
-            tag = encrypted[12:28]
-            ciphertext = encrypted[28:]
-            cipher = ChaCha20.new(key=key, nonce=nonce)
-            return cipher.decrypt_and_verify(ciphertext, tag)
-        except Exception as e:
-            app_logger.error(f"ChaCha20 decryption failed: {e}")
-            raise
-
-    @staticmethod
-    def rsa_generate_keypair(key_size: int = 2048) -> Tuple[bytes, bytes]:
-        """توليد زوج مفاتيح RSA (public, private)"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            key = RSA.generate(key_size)
-            private_key = key.export_key()
-            public_key = key.publickey().export_key()
-            return public_key, private_key
-        except Exception as e:
-            app_logger.error(f"RSA key generation failed: {e}")
-            raise
-
-    @staticmethod
-    def rsa_encrypt(data: bytes, public_key_pem: bytes) -> bytes:
-        """تشفير RSA"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            key = RSA.import_key(public_key_pem)
-            cipher = PKCS1_OAEP.new(key)
-            return cipher.encrypt(data)
-        except Exception as e:
-            app_logger.error(f"RSA encryption failed: {e}")
-            raise
-
-    @staticmethod
-    def rsa_decrypt(encrypted: bytes, private_key_pem: bytes) -> bytes:
-        """فك تشفير RSA"""
-        if not HAS_CRYPTODOME:
-            raise ImportError("pycryptodome not installed")
-        try:
-            key = RSA.import_key(private_key_pem)
-            cipher = PKCS1_OAEP.new(key)
-            return cipher.decrypt(encrypted)
-        except Exception as e:
-            app_logger.error(f"RSA decryption failed: {e}")
-            raise
-
+    # keep other crypto methods from original file as needed (xor, hashes)
     @staticmethod
     def xor_advanced(data: bytes, key: bytes) -> bytes:
-        """تشفير XOR متقدم مع مفتاح ممتد"""
         try:
             expanded = hashlib.sha256(key).digest()
             result = bytearray(len(data))
@@ -186,7 +225,6 @@ class CryptoEngine:
 
     @staticmethod
     def xor_multi_key(data: bytes, keys: list) -> bytes:
-        """تشفير XOR بمفاتيح متعددة"""
         try:
             result = data
             for key in keys:
@@ -197,29 +235,5 @@ class CryptoEngine:
             raise
 
     @staticmethod
-    def sha256(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
-    @staticmethod
-    def sha512(data: bytes) -> str:
-        return hashlib.sha512(data).hexdigest()
-
-    @staticmethod
     def md5(data: bytes) -> str:
         return hashlib.md5(data).hexdigest()
-
-    @staticmethod
-    def base64_encode(data: bytes) -> str:
-        return base64.b64encode(data).decode('utf-8')
-
-    @staticmethod
-    def base64_decode(data: str) -> bytes:
-        return base64.b64decode(data)
-
-    @staticmethod
-    def hex_encode(data: bytes) -> str:
-        return data.hex()
-
-    @staticmethod
-    def hex_decode(data: str) -> bytes:
-        return bytes.fromhex(data)

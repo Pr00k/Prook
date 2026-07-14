@@ -1,0 +1,13 @@
+{
+  "name": "quantum-core",
+  "version": "1.0.0",
+  "description": "Ultimate Game Analysis & Modification Platform",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
